@@ -37,6 +37,7 @@ def train_model(
         gradient_clipping: float = 1.0,
         edge_weight: float = 0.5,
         aux_weight: float = 0.3,
+        num_workers: int = 2,  # 减少工作线程数量
 ):
     # 1. 创建数据集
     try:
@@ -49,18 +50,22 @@ def train_model(
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
-    # 3. 创建数据加载器
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    # 3. 创建数据加载器，限制工作线程数量
+    loader_args = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
-    # 初始化wandb日志
-    experiment = wandb.init(project='ImprovedU-Net', resume='allow', anonymous='must')
-    experiment.config.update(
-        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale,
-             amp=amp, edge_weight=edge_weight, aux_weight=aux_weight)
-    )
+    # 初始化wandb日志 - 可以在这里手动捕获wandb异常
+    try:
+        experiment = wandb.init(project='ImprovedU-Net', resume='allow', anonymous='must')
+        experiment.config.update(
+            dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
+                 val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale,
+                 amp=amp, edge_weight=edge_weight, aux_weight=aux_weight)
+        )
+    except Exception as e:
+        logging.warning(f"wandb初始化失败: {e}. 继续训练但不记录日志。")
+        experiment = None
 
     logging.info(f'''开始训练:
         轮次:          {epochs}
@@ -74,6 +79,7 @@ def train_model(
         混合精度: {amp}
         边缘损失权重: {edge_weight}
         辅助损失权重: {aux_weight}
+        工作线程数: {num_workers}
     ''')
 
     # 4. 设置优化器、损失函数、学习率调度器和AMP的损失缩放
@@ -101,26 +107,43 @@ def train_model(
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
+                # 清除缓存以释放内存
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     # 前向传播（在训练模式下，模型会返回额外的误差信息）
-                    outputs = model(images, true_masks)
-                    if isinstance(outputs, tuple) and len(outputs) == 3:
-                        pred_logits, error_pred, error_true = outputs
-                        # 计算总损失（包括交叉熵、边缘损失和辅助损失）
-                        loss, loss_dict = criterion(pred_logits, true_masks, error_pred, error_true)
-                    else:
-                        # 兼容旧版本模型
-                        pred_logits = outputs
-                        if model.n_classes == 1:
-                            loss = F.binary_cross_entropy_with_logits(pred_logits, true_masks.float())
+                    try:
+                        outputs = model(images, true_masks)
+                        if isinstance(outputs, tuple) and len(outputs) == 3:
+                            pred_logits, error_pred, error_true = outputs
+                            # 计算总损失（包括交叉熵、边缘损失和辅助损失）
+                            loss, loss_dict = criterion(pred_logits, true_masks, error_pred, error_true)
                         else:
-                            loss = F.cross_entropy(pred_logits, true_masks)
-                        loss_dict = {'total_loss': loss.item()}
+                            # 兼容旧版本模型
+                            pred_logits = outputs
+                            if model.n_classes == 1:
+                                loss = F.binary_cross_entropy_with_logits(pred_logits, true_masks.float())
+                            else:
+                                loss = F.cross_entropy(pred_logits, true_masks)
+                            loss_dict = {'total_loss': loss.item()}
+                    except RuntimeError as e:
+                        # 处理内存不足错误，跳过这个批次
+                        if "out of memory" in str(e):
+                            logging.error(f"CUDA内存不足: {e}")
+                            if device.type == 'cuda':
+                                torch.cuda.empty_cache()
+                            continue
+                        else:
+                            raise e
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
+
+                # 防止梯度爆炸
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+
+                grad_scaler.unscale_(optimizer)
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
 
@@ -129,52 +152,63 @@ def train_model(
                 epoch_loss += loss_dict['total_loss']
 
                 # 记录各部分损失
-                log_dict = {f'train_{k}': v for k, v in loss_dict.items()}
-                log_dict.update({'step': global_step, 'epoch': epoch})
-                experiment.log(log_dict)
+                if experiment is not None:
+                    try:
+                        log_dict = {f'train_{k}': v for k, v in loss_dict.items()}
+                        log_dict.update({'step': global_step, 'epoch': epoch})
+                        experiment.log(log_dict)
+                    except Exception as e:
+                        logging.warning(f"wandb日志记录失败: {e}")
 
                 pbar.set_postfix(**{'loss (batch)': loss_dict['total_loss']})
 
-                # 验证轮次
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+                # 验证轮次 - 减少验证频率以节省内存
+                division_step = max(n_train // (2 * batch_size), 1)
+                if global_step % division_step == 0:
+                    # 清理内存
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
 
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
+                    # 计算验证得分
+                    val_score = evaluate(model, val_loader, device, amp)
+                    scheduler.step(val_score)
+                    logging.info('验证Dice得分: {}'.format(val_score))
 
-                        logging.info('验证Dice得分: {}'.format(val_score))
+                    # 尝试记录到wandb，但如果失败则继续训练
+                    if experiment is not None:
                         try:
                             experiment.log({
                                 'learning rate': optimizer.param_groups[0]['lr'],
                                 'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(
-                                        pred_logits.argmax(dim=1)[0].float().cpu() if model.n_classes > 1
-                                        else (torch.sigmoid(pred_logits[0]) > 0.5).float().cpu()),
-                                },
                                 'step': global_step,
                                 'epoch': epoch,
-                                **histograms
                             })
-                        except:
-                            pass
+
+                            # 只在每个epoch末记录图像以节省内存
+                            if global_step % (n_train // batch_size) == 0:
+                                experiment.log({
+                                    'images': wandb.Image(images[0].cpu()),
+                                    'masks': {
+                                        'true': wandb.Image(true_masks[0].float().cpu()),
+                                        'pred': wandb.Image(
+                                            pred_logits.argmax(dim=1)[0].float().cpu() if model.n_classes > 1
+                                            else (torch.sigmoid(pred_logits[0]) > 0.5).float().cpu()),
+                                    }
+                                })
+                        except Exception as e:
+                            logging.warning(f"wandb记录验证数据失败: {e}")
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
+            # 减少检查点大小，只保存必要的数据
+            state_dict = {k: v.cpu() for k, v in state_dict.items()}
             state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'improved_unet_checkpoint_epoch{}.pth'.format(epoch)))
-            logging.info(f'检查点 {epoch} 已保存!')
+
+            # 避免每轮都保存，只保存第1轮、最后一轮和每5轮的检查点
+            if epoch == 1 or epoch == epochs or epoch % 5 == 0:
+                torch.save(state_dict, str(dir_checkpoint / f'improved_unet_checkpoint_epoch{epoch}.pth'))
+                logging.info(f'检查点 {epoch} 已保存!')
 
 
 def get_args():
@@ -192,6 +226,7 @@ def get_args():
     parser.add_argument('--classes', '-c', type=int, default=2, help='类别数')
     parser.add_argument('--edge-weight', '-ew', type=float, default=0.5, help='边缘损失的权重')
     parser.add_argument('--aux-weight', '-aw', type=float, default=0.3, help='辅助损失的权重')
+    parser.add_argument('--num-workers', '-nw', type=int, default=2, help='数据加载器工作线程数')
 
     return parser.parse_args()
 
@@ -203,8 +238,14 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'使用设备 {device}')
 
+    # 设置较小的内存分数，避免内存溢出
+    if device.type == 'cuda':
+        torch.cuda.set_per_process_memory_fraction(0.7)  # 限制GPU内存使用，留出30%给系统
+
     # 根据参数创建改进的U-Net模型
     model = ImprovedUNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+
+    # 使用通道优先格式以优化性能
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'网络:\n'
@@ -231,23 +272,39 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp,
             edge_weight=args.edge_weight,
-            aux_weight=args.aux_weight
+            aux_weight=args.aux_weight,
+            num_workers=args.num_workers
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('检测到内存不足错误! '
-                      '启用检查点以减少内存使用，但这会减慢训练速度。'
-                      '考虑启用AMP (--amp) 进行快速且内存高效的训练')
-        torch.cuda.empty_cache()
+                      '请降低批处理大小或图像尺寸。尝试使用以下命令重新训练:\n'
+                      'python train_improved.py --batch-size 4 --amp')
+
+        # 清理缓存
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+        # 启用检查点以减少内存使用
         model.use_checkpointing()
-        train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp,
-            edge_weight=args.edge_weight,
-            aux_weight=args.aux_weight
-        )
+        try:
+            # 以更小的批处理大小重新训练
+            batch_size = max(args.batch_size // 4, 1)
+            logging.info(f'正在使用较小的批处理大小 ({batch_size}) 和检查点重新尝试...')
+            train_model(
+                model=model,
+                epochs=args.epochs,
+                batch_size=batch_size,  # 显著减小批处理大小
+                learning_rate=args.lr,
+                device=device,
+                img_scale=args.scale,
+                val_percent=args.val / 100,
+                amp=True,  # 强制启用AMP
+                edge_weight=args.edge_weight,
+                aux_weight=args.aux_weight,
+                num_workers=1  # 减少工作线程
+            )
+        except Exception as e:
+            logging.error(f'第二次尝试也失败: {e}\n'
+                          f'请考虑手动降低批处理大小和图像比例，并确保您的系统有足够的虚拟内存。')
+    except Exception as e:
+        logging.error(f'训练过程中发生错误: {e}')
