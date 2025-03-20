@@ -8,3 +8,4 @@ venv/
 .idea/
 wandb/
 results/
+/setup_directory_structure.bat
