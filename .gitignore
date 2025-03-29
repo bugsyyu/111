@@ -12,3 +12,4 @@ results/
 改进的U-Net实现指南.md
 README_inside.md
 docs/improved_unet_architecture.svg
+Dockerfile
